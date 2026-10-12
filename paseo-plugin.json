@@ -1,0 +1,8 @@
+{
+  "id": "claude-workflows",
+  "name": "Claude Workflows",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.11.1"
+  }
+}
