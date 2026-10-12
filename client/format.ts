@@ -17,3 +17,12 @@ export function formatTokens(tokens: number | null): string {
 export function plural(count: number, word: string): string {
   return `${count} ${word}${count === 1 ? "" : "s"}`;
 }
+
+/** "claude-opus-5-5" -> "Opus 5.5", "claude-opus-5-5[1m]" -> "Opus 5.5 1M". Other ids pass through. */
+export function formatModel(model: string): string {
+  const match = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(\[1m\])?$/i.exec(model);
+  if (!match) return model;
+  const [, family, major, minor, longContext] = match;
+  const name = `${family.charAt(0).toUpperCase()}${family.slice(1)} ${major}${minor ? `.${minor}` : ""}`;
+  return longContext ? `${name} 1M` : name;
+}

@@ -1,6 +1,7 @@
-import { access, readdir, readFile, stat } from "node:fs/promises";
+import { access, open, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { WorkflowAgent, WorkflowPhase, WorkflowRun } from "../shared/contract";
 import { JsonlTailer } from "./jsonl-tail";
 import { parseScriptMeta, type ScriptMeta } from "./script-meta";
@@ -10,6 +11,9 @@ function projectsRoot(): string {
 }
 
 const RUN_ID = /^wf_[a-z0-9-]+$/;
+
+const num = (value: unknown): number | null => (typeof value === "number" && Number.isFinite(value) ? value : null);
+const str = (value: unknown): string | null => (typeof value === "string" && value ? value : null);
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -88,6 +92,25 @@ interface TranscriptStats {
   lastTool: string | null;
   lastToolSummary: string | null;
   contextTokens: number | null;
+  model: string | null;
+  effort: string | null;
+}
+
+interface AgentSettings {
+  model: string | null;
+  effort: string | null;
+}
+
+/**
+ * Model and effort from an assistant entry. `requestedModel` is what the agent asked for;
+ * `message.model` is the fallback, except on "<synthetic>" API-error entries.
+ */
+function agentSettings(entry: Record<string, unknown>): AgentSettings | null {
+  if (entry.type !== "assistant") return null;
+  const served = str((entry.message as { model?: unknown } | undefined)?.model);
+  const model = str(entry.requestedModel) ?? (served === "<synthetic>" ? null : served);
+  const effort = str(entry.effort) ?? str(entry.perTurnEffort);
+  return model || effort ? { model, effort } : null;
 }
 
 function oneLine(text: string, max = 140): string {
@@ -114,12 +137,26 @@ function summarizeToolInput(input: unknown): string | null {
 }
 
 const transcripts = new JsonlTailer<TranscriptStats>(
-  () => ({ firstAt: null, lastAt: null, toolCalls: 0, lastTool: null, lastToolSummary: null, contextTokens: null }),
+  () => ({
+    firstAt: null,
+    lastAt: null,
+    toolCalls: 0,
+    lastTool: null,
+    lastToolSummary: null,
+    contextTokens: null,
+    model: null,
+    effort: null,
+  }),
   (stats, entry) => {
     const at = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : NaN;
     if (!Number.isNaN(at)) {
       if (stats.firstAt === null || at < stats.firstAt) stats.firstAt = at;
       if (stats.lastAt === null || at > stats.lastAt) stats.lastAt = at;
+    }
+    const settings = agentSettings(entry);
+    if (settings) {
+      stats.model = settings.model ?? stats.model;
+      stats.effort = settings.effort ?? stats.effort;
     }
     if (entry.type !== "assistant") return;
     const message = entry.message as { content?: unknown; usage?: Record<string, unknown> } | undefined;
@@ -138,6 +175,70 @@ const transcripts = new JsonlTailer<TranscriptStats>(
     }
   },
 );
+
+// ---------- settings of finished agents ----------
+
+const HEAD_CHUNK = 256 * 1024;
+const HEAD_LIMIT = 4 * 1024 * 1024;
+const headSettings = new Map<string, AgentSettings | null>();
+
+/**
+ * Model and effort from the first assistant entry of a finished transcript. The final record
+ * has no effort, and a run's transcripts can total hundreds of MB, so read only up to that
+ * entry (usually within the first 600 KB). Effort does not change during an agent's life.
+ */
+async function readHeadSettings(path: string): Promise<AgentSettings | null> {
+  if (headSettings.has(path)) return headSettings.get(path) ?? null;
+  let handle;
+  try {
+    handle = await open(path, "r");
+  } catch {
+    return null;
+  }
+  let found: AgentSettings | null = null;
+  try {
+    const decoder = new StringDecoder("utf8");
+    const buffer = Buffer.alloc(HEAD_CHUNK);
+    let rest = "";
+    for (let offset = 0; offset < HEAD_LIMIT && !found; ) {
+      const { bytesRead } = await handle.read(buffer, 0, HEAD_CHUNK, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+      const lines = (rest + decoder.write(buffer.subarray(0, bytesRead))).split("\n");
+      rest = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.includes('"assistant"')) continue;
+        try {
+          found = agentSettings(JSON.parse(line) as Record<string, unknown>);
+        } catch {
+          continue;
+        }
+        if (found) break;
+      }
+    }
+  } finally {
+    await handle.close();
+  }
+  headSettings.set(path, found);
+  return found;
+}
+
+/** Fills in what the final record lacks (effort, and model when absent) from the transcripts. */
+async function addSettings(run: WorkflowRun, dirs: string[]): Promise<void> {
+  const runDirs = dirs.map((dir) => join(dir, "subagents", "workflows", run.runId));
+  for (const phase of run.phases) {
+    for (const agent of phase.agents) {
+      if (agent.model && agent.effort) continue;
+      for (const runDir of runDirs) {
+        const settings = await readHeadSettings(join(runDir, `agent-${agent.agentId}.jsonl`));
+        if (!settings) continue;
+        agent.model ??= settings.model;
+        agent.effort ??= settings.effort;
+        break;
+      }
+    }
+  }
+}
 
 // ---------- cached whole-file reads ----------
 
@@ -168,12 +269,10 @@ interface FinalRecord {
   durationMs?: number;
   totalTokens?: number;
   totalToolCalls?: number;
+  defaultModel?: string;
   phases?: { title?: string; detail?: string }[];
   workflowProgress?: Record<string, unknown>[];
 }
-
-const num = (value: unknown): number | null => (typeof value === "number" && Number.isFinite(value) ? value : null);
-const str = (value: unknown): string | null => (typeof value === "string" && value ? value : null);
 
 function runFromFinal(runId: string, record: FinalRecord): WorkflowRun {
   const progress = Array.isArray(record.workflowProgress) ? record.workflowProgress : [];
@@ -211,6 +310,8 @@ function runFromFinal(runId: string, record: FinalRecord): WorkflowRun {
       label: str(item.label) ?? "agent",
       state: str(item.state) ?? "unknown",
       cached: item.cached === true,
+      model: str(item.model) ?? str(record.defaultModel),
+      effort: null,
       startedAt,
       lastActivityAt: num(item.lastProgressAt),
       durationMs,
@@ -294,6 +395,8 @@ async function liveRun(runId: string, dirs: string[]): Promise<WorkflowRun | nul
       label: agent.label,
       state: agent.state,
       cached: false,
+      model: stats?.model ?? null,
+      effort: stats?.effort ?? null,
       startedAt: firstAt,
       lastActivityAt: lastAt,
       durationMs: agent.state !== "running" && firstAt !== null && lastAt !== null ? lastAt - firstAt : null,
@@ -372,7 +475,10 @@ export async function readWorkflowRuns(sessionId: string): Promise<WorkflowRun[]
       const finalPath = finals.get(runId);
       if (finalPath && !(await resumedAfter(finalPath, runId, dirs))) {
         const run = await readCached(finalPath, (text) => runFromFinal(runId, JSON.parse(text) as FinalRecord));
-        if (run) return run;
+        if (run) {
+          await addSettings(run, dirs);
+          return run;
+        }
       }
       return liveRun(runId, dirs);
     }),

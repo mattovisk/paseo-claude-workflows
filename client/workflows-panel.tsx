@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-quer
 import { useEffect, useState } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { workflowRunsRpc, type WorkflowAgent, type WorkflowPhase, type WorkflowRun } from "../shared/contract";
-import { formatDuration, formatTokens, plural } from "./format";
+import { formatDuration, formatModel, formatTokens, plural } from "./format";
 
 type Theme = PluginAgentPanelProps["theme"];
 
@@ -269,6 +269,7 @@ function AgentRow({ agent, theme, now }: { agent: WorkflowAgent; theme: Theme; n
     agent.toolCalls ? plural(agent.toolCalls, "tool") : "",
     formatDuration(elapsed),
   ].filter(Boolean);
+  const settings = [agent.model ? formatModel(agent.model) : "", agent.effort ?? ""].filter(Boolean);
 
   return (
     <View style={{ paddingLeft: 32, paddingRight: 10, paddingVertical: 3, gap: 1 }}>
@@ -288,6 +289,11 @@ function AgentRow({ agent, theme, now }: { agent: WorkflowAgent; theme: Theme; n
         </Text>
         <Text style={{ color: c.foregroundMuted, fontSize: 11 }}>{facts.join(" · ")}</Text>
       </View>
+      {settings.length > 0 ? (
+        <Text numberOfLines={1} style={{ marginLeft: 12, color: c.foregroundMuted, fontSize: 11 }}>
+          {settings.join(" · ")}
+        </Text>
+      ) : null}
       {detail ? (
         <Text
           numberOfLines={2}

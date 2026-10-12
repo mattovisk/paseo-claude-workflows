@@ -7,6 +7,10 @@ export const WorkflowAgentSchema = z.object({
   /** "running", "done" or "error" from the journal; final records may carry other values verbatim. */
   state: z.string(),
   cached: z.boolean(),
+  /** Model id the agent requested, as Claude Code records it ("claude-opus-5-5", "claude-opus-5-5[1m]"). */
+  model: z.string().nullable(),
+  /** Reasoning effort the agent ran at ("high", "xhigh", ...). */
+  effort: z.string().nullable(),
   startedAt: z.number().nullable(),
   lastActivityAt: z.number().nullable(),
   durationMs: z.number().nullable(),
